@@ -1,0 +1,1414 @@
+# cogs/onboarding.py
+
+import json
+import discord
+from typing import Optional, Dict, Any, List, Tuple, Set
+from discord.ext import commands, tasks
+from discord import app_commands, ui, Interaction
+import string
+import secrets  # Changed from random to secrets for secure token generation
+import aiohttp
+import asyncio
+import logging
+import logging.handlers
+import os
+from typing import Optional, Dict, Any, List
+from datetime import datetime, timezone, timedelta
+from dotenv import load_dotenv
+
+# ------------------------------ Load Environment Variables ------------------------------
+load_dotenv()
+
+# ------------------------------ Setup Logging ------------------------------
+logger = logging.getLogger('onboarding')
+logger.setLevel(logging.DEBUG)
+
+handler = logging.handlers.RotatingFileHandler(
+    filename='onboarding.log',
+    encoding='utf-8',
+    mode='a',
+    maxBytes=5 * 1024 * 1024,  # 5 MB
+    backupCount=5
+)
+handler.setLevel(logging.DEBUG)
+formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
+handler.setFormatter(formatter)
+
+if not logger.handlers:
+    logger.addHandler(handler)
+
+# ------------------------------ Environment Variables ------------------------------
+def get_required_env(key: str) -> str:
+    """Get a required environment variable or raise an error."""
+    value = os.getenv(key)
+    if not value:
+        raise ValueError(f"{key} environment variable is required")
+    return value
+
+CODA_API_TOKEN = get_required_env('CODA_API_TOKEN')
+DOC_ID = get_required_env('DOC_ID')
+TABLE_ID = get_required_env('TABLE_ID')
+GUILD_ID = int(get_required_env('GUILD_ID'))
+WELCOME_CHANNEL_ID = int(get_required_env('WELCOME_CHANNEL_ID'))
+STAFF_NOTIFICATION_CHANNEL_ID = int(get_required_env('STAFF_NOTIFICATION_CHANNEL_ID'))
+
+# ------------------------------ Import Constants and Modals ------------------------------
+from .constants import (
+    DIVISION_CODES, RANKS, RANK_NUMBERS, RANK_ABBREVIATIONS,
+    ALL_RANK_ABBREVIATIONS, MEMBER_ROLE_THRESHOLD
+)
+
+from .modals import OnboardingSurveyModal
+
+
+class DMTracker:
+    def __init__(self, filename='dm_status.json'):
+        self.filename = filename
+        self.dm_statuses = {}
+        self.lock = asyncio.Lock()
+        self.load_dm_statuses()
+        logger.info(f"DMTracker initialized with file: {filename}")
+        logger.info(f"Loaded statuses for users: {list(self.dm_statuses.keys())}")
+
+    def load_dm_statuses(self):
+        """Load DM statuses from JSON file."""
+        try:
+            if os.path.exists(self.filename):
+                with open(self.filename, 'r') as f:
+                    self.dm_statuses = json.load(f)
+                    logger.info(f"Successfully loaded {len(self.dm_statuses)} entries from {self.filename}")
+                    for user_id, status in self.dm_statuses.items():
+                        logger.debug(f"Loaded status for user {user_id}: {status}")
+            else:
+                logger.warning(f"DM status file {self.filename} does not exist")
+                self.dm_statuses = {}
+        except Exception as e:
+            logger.error(f"Error loading DM statuses: {str(e)}", exc_info=True)
+            self.dm_statuses = {}
+
+    async def save_dm_statuses(self):
+        """Save DM statuses to JSON file."""
+        async with self.lock:
+            try:
+                with open(self.filename, 'w') as f:
+                    json.dump(self.dm_statuses, f, indent=4)
+                    logger.debug(f"Saved DM statuses to {self.filename}")
+            except Exception as e:
+                logger.error(f"Error saving DM statuses: {str(e)}", exc_info=True)
+
+    async def update_dm_status(self, user_id: str, status: str, channel_attempts: int = None):
+        """Update DM status for a user."""
+        now = datetime.now(timezone.utc)
+        logger.debug(f"Updating status for user {user_id} to {status}")
+        
+        async with self.lock:
+            current_status = self.dm_statuses.get(str(user_id), {})
+            
+            updated_status = {
+                "status": status,
+                "last_updated": now.isoformat(),
+                "dm_sent": current_status.get("dm_sent", False),
+                "channel_attempts": channel_attempts if channel_attempts is not None else current_status.get("channel_attempts", 0),
+                "last_channel_attempt": current_status.get("last_channel_attempt"),
+                "admin_notified": current_status.get("admin_notified", False)
+            }
+            
+            if status == "dm_success":
+                updated_status["dm_sent"] = True
+            
+            if channel_attempts is not None and channel_attempts > updated_status["channel_attempts"]:
+                updated_status["last_channel_attempt"] = now.isoformat()
+                updated_status["channel_attempts"] = channel_attempts
+
+            self.dm_statuses[str(user_id)] = updated_status
+            await self.save_dm_statuses()
+
+    def get_dm_status(self, user_id: str) -> dict:
+        """Get DM status for a user."""
+        status = self.dm_statuses.get(str(user_id))
+        logger.debug(f"Getting status for user {user_id}: {status}")
+        return status or {"status": "not_attempted", "last_updated": None}
+
+    async def remove_user(self, user_id: str):
+        """Remove a user from tracking (e.g., after they start onboarding)."""
+        async with self.lock:
+            if str(user_id) in self.dm_statuses:
+                del self.dm_statuses[str(user_id)]
+                await self.save_dm_statuses()
+                logger.debug(f"Removed user {user_id} from DM tracking")
+
+
+# ------------------------------ Define Admin Command Group ------------------------------
+admin_onboarding = app_commands.Group(
+    name='admin_onboarding',
+    description='Administrative commands for onboarding',
+    guild_ids=[GUILD_ID]
+)
+
+class TokenExpiredError(Exception):
+    """Raised when a token has expired."""
+    pass
+
+# ------------------------------ Rate Limiting ------------------------------
+class RateLimiter:
+    def __init__(self, calls: int, period: float):
+        self.calls = calls
+        self.period = period
+        self.timestamps: List[float] = []
+        self._lock = asyncio.Lock()
+
+    async def acquire(self):
+        async with self._lock:
+            now = datetime.now().timestamp()
+            self.timestamps = [ts for ts in self.timestamps if now - ts <= self.period]
+            
+            if len(self.timestamps) >= self.calls:
+                sleep_time = self.timestamps[0] + self.period - now
+                if sleep_time > 0:
+                    await asyncio.sleep(sleep_time)
+                    
+            self.timestamps.append(now)
+
+# ------------------------------ Cog Definition ------------------------------
+class OnboardingCog(commands.Cog):
+    def __init__(self, bot: commands.Bot):
+        self.bot = bot
+        self.session: Optional[aiohttp.ClientSession] = None
+        self.CODA_COLUMNS: Dict[str, str] = {}
+        self.registered_user_ids: set = set()
+        self.lock = asyncio.Lock()
+        self.GUILD_ID = GUILD_ID
+        self.rate_limiter = RateLimiter(calls=5, period=1.0)
+        self.token_expiry = 24 * 3600
+        self.dm_tracker = DMTracker()
+        self.row_creation_lock = asyncio.Lock()
+        logger.info("OnboardingCog initialized with DMTracker")
+
+    async def initialize_session(self):
+        """Initialize the aiohttp session."""
+        if self.session is None or self.session.closed:
+            self.session = aiohttp.ClientSession()
+
+    async def cleanup_session(self):
+        """Cleanup the aiohttp session."""
+        if self.session and not self.session.closed:
+            await self.session.close()
+
+    async def cog_load(self):
+        """Called when the cog is loaded."""
+        logger.info("OnboardingCog is loading. Fetching Coda.io column IDs.")
+        await self.initialize_session()
+        await self.fetch_columns_from_coda()
+        if not self.validate_columns():
+            logger.critical("Required columns are missing in Coda.io table. Disabling OnboardingCog.")
+            await self.bot.remove_cog(self.__class__.__name__)
+        else:
+            logger.info("OnboardingCog loaded successfully with all required columns.")
+            await self.refresh_registered_user_ids()
+            self.check_pending_onboarding.start()
+            self.send_onboarding_reminders.start()
+            self.check_new_members.start()
+
+    async def cog_unload(self):
+        """Called when the cog is unloaded."""
+        self.check_pending_onboarding.cancel()
+        self.send_onboarding_reminders.cancel()
+        self.check_new_members.cancel()  # Add this line
+        await self.cleanup_session()
+        logger.info("OnboardingCog has been unloaded and aiohttp session closed.")
+        
+    def validate_columns(self) -> bool:
+        """Validates that all required columns are present in Coda.io."""
+        required_columns = [
+            'ID Number', 'Star Citizen Handle', 'Discord Username', 
+            'Discord User ID', 'Division', 'Rank', 'Token', 'Status', 
+            'Type', 'Preferred Gameplay', 'Other Interests', 
+            'Reason for Association', 'Started At'
+        ]
+        missing_columns = [col for col in required_columns if col not in self.CODA_COLUMNS]
+        if missing_columns:
+            logger.critical(f"Missing required columns in Coda.io table: {', '.join(missing_columns)}")
+            return False
+        return True
+
+    # ------------------------------ Coda.io API Methods ------------------------------
+    async def coda_api_request(
+        self, 
+        method: str, 
+        endpoint: str, 
+        data: Optional[Dict[str, Any]] = None,
+        params: Optional[Dict[str, Any]] = None,
+        api_version: str = 'v1'
+    ) -> Optional[Dict[str, Any]]:
+        """Handles API requests to Coda.io with rate limiting."""
+        await self.rate_limiter.acquire()
+        
+        base_url = f'https://coda.io/apis/{api_version}'
+        url = f'{base_url}/{endpoint}'
+        headers = {
+            'Authorization': f'Bearer {CODA_API_TOKEN}',
+            'Content-Type': 'application/json'
+        }
+
+        retries = 0
+        max_retries = 5
+        backoff_factor = 2
+        retry_delay = 1
+
+        while retries < max_retries:
+            try:
+                async with self.session.request(
+                    method, 
+                    url, 
+                    headers=headers, 
+                    json=data,
+                    params=params
+                ) as response:
+                    response_text = await response.text()
+                    logger.debug(f"Request URL: {url}")
+                    logger.debug(f"Response Status: {response.status}")
+                    logger.debug(f"Response Text: {response_text}")
+
+                    if response.status in [200, 202]:
+                        logger.debug(f"Coda.io {method} request to {url} successful.")
+                        return await response.json()
+                    elif response.status == 429:
+                        retry_after = int(response.headers.get('Retry-After', retry_delay))
+                        logger.warning(f"Rate limited by Coda.io. Retrying after {retry_after} seconds...")
+                        await asyncio.sleep(retry_after)
+                        retries += 1
+                        retry_delay *= backoff_factor
+                    else:
+                        logger.error(f"Coda.io {method} request to {url} failed with status {response.status}.", exc_info=True)
+                        return None
+
+            except Exception as e:
+                logger.error(f"An error occurred during Coda API request to {url}: {str(e)}", exc_info=True)
+                await asyncio.sleep(retry_delay)
+                retries += 1
+                retry_delay *= backoff_factor
+
+        logger.error(f"Failed to complete Coda.io {method} request to {url} after {max_retries} retries.")
+        return None
+
+    async def fetch_columns_from_coda(self) -> None:
+        """Fetches column IDs from the Coda.io table."""
+        endpoint = f'docs/{DOC_ID}/tables/{TABLE_ID}/columns'
+        response = await self.coda_api_request('GET', endpoint)
+        if response and 'items' in response:
+            self.CODA_COLUMNS = {column['name']: column['id'] for column in response['items']}
+            logger.info(f"Fetched columns from Coda.io: {self.CODA_COLUMNS}")
+        else:
+            logger.error("Failed to fetch columns from Coda.io.")
+
+    def validate_columns(self) -> bool:
+        """Validates that all required columns are present in Coda.io."""
+        required_columns = [
+            'ID Number', 'Discord Username', 'Discord User ID', 'Division',
+            'Rank', 'Token', 'Status', 'Type',
+            'Preferred Gameplay', 'Other Interests', 'Reason for Association',
+            'Started At', 'Last Reminder Sent', 'Join Date'
+        ]
+        missing_columns = [col for col in required_columns if col not in self.CODA_COLUMNS]
+        if missing_columns:
+            logger.critical(f"Missing required columns in Coda.io table: {', '.join(missing_columns)}")
+            return False
+        return True
+
+    async def refresh_registered_user_ids(self) -> None:
+        """Refreshes the set of registered user IDs from Coda.io."""
+        async with self.lock:
+            endpoint_base = f'docs/{DOC_ID}/tables/{TABLE_ID}/rows?useColumnNames=true'
+            self.registered_user_ids = set()
+            page_token = None
+            
+            while True:
+                endpoint = f'{endpoint_base}&pageToken={page_token}' if page_token else endpoint_base
+                response = await self.coda_api_request('GET', endpoint)
+                
+                if response and 'items' in response:
+                    for item in response['items']:
+                        values = item.get('values', {})
+                        discord_user_id = values.get('Discord User ID')
+                        if discord_user_id:
+                            self.registered_user_ids.add(str(discord_user_id).strip())
+                    
+                    page_token = response.get('nextPageToken')
+                    if not page_token:
+                        break
+                else:
+                    logger.error("Failed to fetch registered user IDs from Coda.io.")
+                    break
+            
+            logger.info(f"Registered user IDs fetched: {len(self.registered_user_ids)} users.")
+
+    async def get_member_row_by_discord_id(self, discord_user_id: str) -> Optional[dict]:
+        """Retrieves a member row from Coda.io based on Discord User ID."""
+        all_rows = await self.get_all_rows()
+        for item in all_rows:
+            values = item.get('values', {})
+            if values.get('Discord User ID') == discord_user_id:
+                return item
+        return None
+
+    async def get_all_rows(self) -> list:
+        """Retrieves all rows from the Coda.io table."""
+        rows = []
+        endpoint_base = f'docs/{DOC_ID}/tables/{TABLE_ID}/rows?useColumnNames=true&limit=500'
+        page_token = None
+        
+        while True:
+            endpoint = f'{endpoint_base}&pageToken={page_token}' if page_token else endpoint_base
+            response = await self.coda_api_request('GET', endpoint)
+            
+            if response and 'items' in response:
+                rows.extend(response['items'])
+                page_token = response.get('nextPageToken')
+                if not page_token:
+                    break
+            else:
+                logger.error("Failed to fetch rows from Coda.io.")
+                break
+                
+        return rows
+
+    async def add_member_to_coda_on_start(self, updates: Dict[str, Any]) -> Optional[str]:
+        """Adds a new member to Coda.io during onboarding start."""
+        required_columns = ['Discord User ID', 'Discord Username', 'Status', 'Token', 'Type', 'Started At']
+        if not all(col in self.CODA_COLUMNS for col in required_columns):
+            logger.critical("Cannot add member to Coda.io: Missing required columns.")
+            return None
+
+        data = {
+            'rows': [
+                {
+                    'cells': [
+                        {'column': self.CODA_COLUMNS[key], 'value': value} 
+                        for key, value in updates.items()
+                    ]
+                }
+            ]
+        }
+
+        response = await self.coda_api_request('POST', f'docs/{DOC_ID}/tables/{TABLE_ID}/rows', data)
+        if response and 'addedRowIds' in response:
+            added_row_id = response['addedRowIds'][0]
+            logger.info(f"Added new onboarding start for user ID: {updates['Discord User ID']}, Row ID: {added_row_id}")
+            async with self.lock:
+                self.registered_user_ids.add(str(updates['Discord User ID']).strip())
+            return added_row_id
+        else:
+            logger.error(f"Failed to add onboarding start for user ID: {updates['Discord User ID']}")
+            return None
+
+    # ------------------------------ Utility Methods ------------------------------
+    def generate_token(self, length: int = 8) -> str:
+        """Generates a cryptographically secure random token."""
+        return ''.join(secrets.choice(string.ascii_uppercase + string.digits) 
+                      for _ in range(length))
+
+    async def generate_unique_id(self, division_code: str, rank_number: int) -> Optional[str]:
+        """Generates a unique ID based on division code and rank number."""
+        try:
+            max_attempts = 1000
+            existing_ids = {row['values'].get('ID Number') for row in await self.get_all_rows()}
+            
+            for _ in range(max_attempts):
+                random_part = ''.join(secrets.choice(string.digits) for _ in range(4))
+                unique_id = f"{division_code}-{rank_number}-{random_part}"
+                if unique_id not in existing_ids:
+                    logger.debug(f"Generated unique ID: {unique_id}")
+                    return unique_id
+                    
+            logger.error("Exceeded maximum attempts to generate a unique ID.")
+            return None
+        except Exception as e:
+            logger.error(f"Error generating unique ID: {str(e)}", exc_info=True)
+            return None
+
+    async def get_or_create_row_id(self, member: discord.Member, member_type: str) -> Optional[str]:
+        """Retrieves the row ID for a member. If not exists, creates one. Handles duplicate cleanup."""
+        logger.debug(f"Attempting to retrieve or create row ID for {member}.")
+        
+        async with self.row_creation_lock:  # Prevent race conditions
+            try:
+                # Get all rows for this Discord ID
+                all_rows = await self.get_all_rows()
+                matching_rows = [
+                    row for row in all_rows 
+                    if row.get('values', {}).get('Discord User ID') == str(member.id)
+                ]
+                
+                if matching_rows:
+                    logger.info(f"Found {len(matching_rows)} existing rows for {member}")
+                    
+                    # If multiple rows exist, clean up duplicates
+                    if len(matching_rows) > 1:
+                        logger.warning(f"Found duplicate entries for {member}. Cleaning up...")
+                        
+                        # Sort rows by status and date to keep the most relevant one
+                        sorted_rows = sorted(
+                            matching_rows,
+                            key=lambda r: (
+                                # Priority order: Active > Started > other statuses
+                                0 if r.get('values', {}).get('Status') == 'Active' else
+                                1 if r.get('values', {}).get('Status') == 'Started' else 2,
+                                # Secondary sort by date if available
+                                r.get('values', {}).get('Started At', '0')
+                            )
+                        )
+                        
+                        # Keep the highest priority row
+                        keep_row = sorted_rows[0]
+                        rows_to_delete = sorted_rows[1:]
+                        
+                        # Delete duplicate rows
+                        for row in rows_to_delete:
+                            try:
+                                endpoint = f"docs/{DOC_ID}/tables/{TABLE_ID}/rows/{row['id']}"
+                                await self.coda_api_request('DELETE', endpoint)
+                                logger.info(f"Deleted duplicate row {row['id']} for {member}")
+                                await asyncio.sleep(0.5)  # Prevent rate limiting
+                            except Exception as e:
+                                logger.error(f"Error deleting duplicate row {row['id']}: {e}")
+                        
+                        logger.info(f"Kept row {keep_row['id']} for {member}")
+                        return keep_row['id']
+                    
+                    # Single row found
+                    logger.debug(f"Found existing row ID for {member}: {matching_rows[0]['id']}")
+                    return matching_rows[0]['id']
+                
+                # No existing row found, create new one
+                logger.info(f"No existing row found for {member}. Creating new entry.")
+                
+                # Add delay before creating new row to prevent rate limiting
+                await asyncio.sleep(0.5)
+                
+                # Generate new member data
+                token = self.generate_token()
+                division_code = 'ND'  # Start with Non-Division
+                rank_name = 'Crewman Recruit' if member_type == 'Member' else 'Associate'
+                rank_number = RANK_NUMBERS.get(rank_name, 21 if member_type == 'Member' else 50)
+                
+                max_retries = 3
+                for attempt in range(max_retries):
+                    try:
+                        id_number = await self.generate_unique_id(division_code, rank_number)
+                        if not id_number:
+                            logger.error("Failed to generate a unique ID.")
+                            return None
+                            
+                        started_at = datetime.now(timezone.utc).isoformat()
+                        
+                        # Create initial data
+                        updates = {
+                            'Discord User ID': str(member.id),
+                            'Discord Username': str(member),
+                            'Status': 'Started',
+                            'Token': token,
+                            'Type': member_type,
+                            'ID Number': id_number,
+                            'Division': 'Non-Division',
+                            'Rank': rank_name,
+                            'Started At': started_at,
+                            'Join Date': started_at
+                        }
+
+                        # Add the new row to Coda
+                        row_id = await self.add_member_to_coda_on_start(updates)
+                        if row_id:
+                            logger.info(f"Successfully created new row for {member}: {row_id}")
+                            return row_id
+                        
+                        if attempt < max_retries - 1:
+                            await asyncio.sleep(1 * (attempt + 1))  # Exponential backoff
+                        else:
+                            logger.error(f"Failed to create onboarding row for {member} after {max_retries} attempts.")
+                            return None
+                            
+                    except Exception as e:
+                        if attempt == max_retries - 1:
+                            logger.error(f"Final attempt failed for {member}: {e}", exc_info=True)
+                            raise
+                        logger.warning(f"Attempt {attempt + 1} failed for {member}: {e}")
+                        await asyncio.sleep(1 * (attempt + 1))
+                        
+            except Exception as e:
+                logger.error(f"Error in get_or_create_row_id for {member}: {str(e)}", exc_info=True)
+                return None
+
+    # ------------------------------ Role Management Methods ------------------------------
+    async def assign_roles(
+        self, 
+        member: discord.Member, 
+        rank_role_name: str,
+        guild: discord.Guild
+    ) -> tuple[bool, Optional[str]]:
+        """Assigns roles to a member and returns success status and error message."""
+        try:
+            # Get Non-Division role
+            non_division_role = discord.utils.get(guild.roles, name='Non-Division')
+            if not non_division_role:
+                return False, "Required role 'Non-Division' not found."
+
+            # Get rank role
+            rank_role = discord.utils.get(guild.roles, name=rank_role_name)
+            if not rank_role:
+                return False, f"Required role '{rank_role_name}' not found."
+
+            # Assign roles
+            await member.add_roles(non_division_role, rank_role, reason="Onboarding completion")
+            logger.info(f"Assigned roles to {member}: Non-Division, {rank_role_name}")
+            return True, None
+
+        except discord.Forbidden:
+            return False, "Bot lacks permission to assign roles."
+        except Exception as e:
+            logger.error(f"Error assigning roles to {member}: {str(e)}", exc_info=True)
+            return False, "An unexpected error occurred while assigning roles."
+
+    async def update_member_nickname(
+        self, 
+        member: discord.Member, 
+        rank_name: str,
+        member_type: str
+    ) -> tuple[bool, Optional[str]]:
+        """Updates member nickname with rank abbreviation."""
+        try:
+            rank_abbrev = RANK_ABBREVIATIONS.get(
+                rank_name, 
+                'CWR' if member_type == 'Member' else 'ASC'
+            )
+            await member.edit(nick=f"{rank_abbrev} {member.name}")
+            logger.info(f"Updated nickname for {member}")
+            return True, None
+        except discord.Forbidden:
+            return False, "Bot lacks permission to change nicknames."
+        except Exception as e:
+            logger.error(f"Error updating nickname for {member}: {str(e)}", exc_info=True)
+            return False, "An unexpected error occurred while updating nickname."
+
+    # ------------------------------ Handle Onboarding Start ------------------------------
+    async def handle_onboarding_start(self, interaction: discord.Interaction, member_type: str):
+        """Handles the onboarding process when a user selects their member type."""
+        logger.debug(f"Handling onboarding start for {interaction.user} as '{member_type}'.")
+        
+        # Remove user from DM tracking when they start onboarding
+        await self.dm_tracker.remove_user(str(interaction.user.id))
+        
+        # Check for rate limiting
+        try:
+            await self.rate_limiter.acquire()
+        except Exception as e:
+            logger.error(f"Rate limit error: {str(e)}", exc_info=True)
+            await interaction.followup.send(
+                "❌ Too many requests. Please try again in a moment.",
+                ephemeral=True
+            )
+            return
+
+        # Retrieve or create the row ID
+        row_id = await self.get_or_create_row_id(interaction.user, member_type)
+        if row_id:
+            # Proceed to show the survey modal
+            modal = OnboardingSurveyModal(
+                self, 
+                row_id, 
+                member_type, 
+                interaction.guild.id if interaction.guild else self.GUILD_ID
+            )
+            try:
+                await interaction.response.send_modal(modal)
+                logger.debug(f"Sent OnboardingSurveyModal to {interaction.user} for row ID {row_id}.")
+            except Exception as e:
+                logger.error(f"Error sending modal: {str(e)}", exc_info=True)
+                await interaction.followup.send(
+                    "❌ An error occurred while starting onboarding. Please try again later.",
+                    ephemeral=True
+                )
+        else:
+            await interaction.followup.send(
+                "❌ Onboarding is currently unavailable. Please try again later.",
+                ephemeral=True
+            )
+            logger.error(f"Failed to add onboarding start for member {interaction.user}.")
+
+    # ------------------------------ Update Methods ------------------------------
+    async def update_member_info_by_discord_id(
+        self, 
+        discord_user_id: str, 
+        updates: Dict[str, Any]
+    ) -> bool:
+        """Updates member information in Coda.io based on Discord User ID."""
+        member_row = await self.get_member_row_by_discord_id(discord_user_id)
+        if member_row:
+            member_row_id = member_row['id']
+            return await self.update_member_info(member_row_id, updates)
+        else:
+            logger.warning(f"No Coda row found for member with Discord User ID {discord_user_id}")
+            return False
+
+    async def update_member_info(
+        self, 
+        member_row_id: str, 
+        updates: Dict[str, Any]
+    ) -> bool:
+        """Updates member information in Coda.io based on Row ID."""
+        cells = []
+        for key, value in updates.items():
+            if key in self.CODA_COLUMNS:
+                cells.append({'column': self.CODA_COLUMNS[key], 'value': value})
+            else:
+                logger.warning(f"Update key '{key}' does not match any column in Coda.io.")
+
+        if not cells:
+            logger.warning("No valid data to update.")
+            return False
+
+        data = {
+            'row': {
+                'cells': cells
+            }
+        }
+        
+        try:
+            endpoint = f'docs/{DOC_ID}/tables/{TABLE_ID}/rows/{member_row_id}'
+            response = await self.coda_api_request('PUT', endpoint, data)
+            
+            if response:
+                logger.info(f"Updated data for member row ID: {member_row_id}")
+                return True
+            else:
+                logger.error(f"Failed to update data for row ID: {member_row_id}")
+                return False
+                
+        except Exception as e:
+            logger.error(f"Exception updating member info: {str(e)}", exc_info=True)
+            return False
+
+    # ------------------------------ Background Tasks ------------------------------
+    @tasks.loop(hours=1)
+    async def check_pending_onboarding(self):
+        """Check for pending onboarding and send reminders."""
+        try:
+            current_time = datetime.now(timezone.utc)
+            guild = self.bot.get_guild(GUILD_ID)
+            if not guild:
+                logger.error("Could not find guild")
+                return
+
+            # Get members who haven't completed onboarding
+            endpoint = f'docs/{DOC_ID}/tables/{TABLE_ID}/rows'
+            params = {'query': 'Status="Started"', 'useColumnNames': 'true'}
+            
+            response = await self.coda_api_request('GET', endpoint, params=params)
+            if not response or 'items' not in response:
+                return
+
+            welcome_channel = guild.get_channel(WELCOME_CHANNEL_ID)
+            staff_channel = guild.get_channel(STAFF_NOTIFICATION_CHANNEL_ID)
+
+            for item in response['items']:
+                values = item.get('values', {})
+                started_at = datetime.fromisoformat(values.get('Started At', ''))
+                last_reminder = values.get('Last Reminder Sent')
+                if last_reminder:
+                    last_reminder = datetime.fromisoformat(last_reminder)
+                
+                discord_user_id = values.get('Discord User ID')
+                if not discord_user_id:
+                    continue
+
+                member = guild.get_member(int(discord_user_id))
+                if not member:
+                    continue
+
+                hours_since_start = (current_time - started_at).total_seconds() / 3600
+
+                # Check token expiry
+                if hours_since_start >= self.token_expiry / 3600:
+                    # Generate new token and update
+                    new_token = self.generate_token()
+                    await self.update_member_info(
+                        item['id'],
+                        {
+                            'Token': new_token,
+                            'Started At': current_time.isoformat()
+                        }
+                    )
+                    try:
+                        await member.send(
+                            f"Your onboarding token has expired. Here's your new token: {new_token}"
+                        )
+                    except discord.Forbidden:
+                        if welcome_channel:
+                            await welcome_channel.send(
+                                f"{member.mention} Your onboarding token has expired. "
+                                "Please use `/start` to begin the process again."
+                            )
+
+                # 24-hour reminder
+                elif hours_since_start >= 24 and (not last_reminder or (current_time - last_reminder).total_seconds() > 86400):
+                    if welcome_channel:
+                        await welcome_channel.send(
+                            f"{member.mention} Don't forget to complete your onboarding! "
+                            "If you didn't receive a DM from the bot, please use the `/start` command to begin the process."
+                        )
+                        
+                        await self.update_member_info(
+                            item['id'],
+                            {'Last Reminder Sent': current_time.isoformat()}
+                        )
+
+                # 72-hour staff notification
+                elif hours_since_start >= 72 and staff_channel:
+                    staff_embed = discord.Embed(
+                        title="⚠️ Incomplete Onboarding Alert",
+                        description=(
+                            f"Member {member.mention} has not completed onboarding after 3 days.\n"
+                            f"Started At: {started_at.strftime('%Y-%m-%d %H:%M:%S')}"
+                        ),
+                        color=discord.Color.red()
+                    )
+                    await staff_channel.send(embed=staff_embed)
+                    
+                    await self.update_member_info(
+                        item['id'],
+                        {'Last Reminder Sent': current_time.isoformat()}
+                    )
+
+        except Exception as e:
+            logger.error(f"Error in check_pending_onboarding: {str(e)}", exc_info=True)
+
+    @tasks.loop(hours=1)
+    async def send_onboarding_reminders(self):
+        """Periodically checks for and reminds users who haven't completed onboarding."""
+        logger.info("Running onboarding reminder task.")
+        try:
+            await self.refresh_registered_user_ids()
+            pending_users = await self.get_pending_onboardings()
+            now = datetime.now(timezone.utc)
+
+            # Get guild and welcome channel for fallback
+            guild = self.bot.get_guild(GUILD_ID)
+            welcome_channel = guild.get_channel(WELCOME_CHANNEL_ID) if guild else None
+
+            for user_id_str, data in pending_users.items():
+                user_id = int(user_id_str)
+                
+                # First, check the DM tracker status
+                dm_status = self.dm_tracker.get_dm_status(user_id_str)
+                
+                # Skip if user has already been fully processed
+                if (dm_status.get("status") == "dm_failed" and 
+                    dm_status.get("channel_attempts", 0) >= 3 and 
+                    dm_status.get("admin_notified", True)):
+                    logger.debug(f"Skipping user {user_id_str} - already processed")
+                    continue
+                    
+                started_at = data.get('Started At')
+                last_reminder = data.get('Last Reminder Sent')
+
+                if not started_at:
+                    continue
+
+                time_since_started = (now - started_at).total_seconds()
+                time_since_reminder = (now - last_reminder).total_seconds() if last_reminder else None
+
+                should_send_reminder = (
+                    time_since_started > 24 * 3600 and
+                    (last_reminder is None or (time_since_reminder and time_since_reminder > 24 * 3600))
+                )
+
+                if should_send_reminder:
+                    user = self.bot.get_user(user_id)
+                    if user:
+                        # Skip DM if already failed
+                        if dm_status.get("status") != "dm_failed":
+                            try:
+                                await user.send(
+                                    "Hello! It looks like you haven't completed your onboarding process. "
+                                    "Please use `/start` to continue."
+                                )
+                                logger.info(f"Successfully sent DM reminder to {user}")
+                                await self.dm_tracker.update_dm_status(
+                                    user_id_str,
+                                    "dm_success",
+                                    channel_attempts=0
+                                )
+
+                                # Update reminder timestamp after successful DM
+                                await self.update_member_info_by_discord_id(
+                                    user_id_str,
+                                    {'Last Reminder Sent': now.isoformat()}
+                                )
+
+                            except discord.Forbidden:
+                                logger.warning(f"Could not DM user {user} for onboarding reminder (Forbidden).")
+                                await self.dm_tracker.update_dm_status(
+                                    user_id_str,
+                                    "dm_failed",
+                                    channel_attempts=0
+                                )
+                        
+                        # Handle channel mentions if DM failed and we haven't reached max attempts
+                        elif (dm_status.get("status") == "dm_failed" and 
+                              dm_status.get("channel_attempts", 0) < 3 and 
+                              not dm_status.get("admin_notified", True)):
+                            
+                            channel_attempts = dm_status.get("channel_attempts", 0)
+                            last_attempt = dm_status.get("last_channel_attempt")
+                            should_attempt = True
+
+                            if last_attempt:
+                                last_attempt = datetime.fromisoformat(last_attempt)
+                                time_since_attempt = (now - last_attempt).total_seconds()
+                                if time_since_attempt < 7 * 24 * 3600:  # 7 days
+                                    should_attempt = False
+
+                            if should_attempt and welcome_channel:
+                                await welcome_channel.send(
+                                    f"{user.mention}, I tried to send you a DM about onboarding, "
+                                    "but your DMs are disabled. Please use `/start` to begin "
+                                    "the onboarding process."
+                                )
+                                new_attempts = channel_attempts + 1
+                                await self.dm_tracker.update_dm_status(
+                                    user_id_str,
+                                    "dm_failed",
+                                    channel_attempts=new_attempts
+                                )
+                                
+                                # Mark as admin notified if this was the last attempt
+                                if new_attempts >= 3:
+                                    await self.dm_tracker.update_dm_status(
+                                        user_id_str,
+                                        "dm_failed",
+                                        channel_attempts=3
+                                    )
+                                    
+                                    # Send admin notification
+                                    admin_channel = guild.get_channel(STAFF_NOTIFICATION_CHANNEL_ID)
+                                    if admin_channel:
+                                        join_date = user.joined_at.strftime("%Y-%m-%d %H:%M:%S UTC") if user.joined_at else "Unknown"
+                                        embed = discord.Embed(
+                                            title="⚠️ Onboarding Alert",
+                                            description=(
+                                                f"Member {user.mention} has not started onboarding after 3 reminder attempts\n"
+                                                f"Joined: {join_date}\n"
+                                                "DMs are disabled and channel mentions have been unsuccessful."
+                                            ),
+                                            color=discord.Color.red()
+                                        )
+                                        await admin_channel.send(embed=embed)
+
+        except Exception as e:
+            logger.error(f"Error in send_onboarding_reminders: {str(e)}", exc_info=True)
+
+    # Add a delay before starting the reminder loop
+    @send_onboarding_reminders.before_loop
+    async def before_reminder_loop(self):
+        """Wait until the bot is ready before starting the reminder loop."""
+        await self.bot.wait_until_ready()
+        # Add an initial delay to prevent immediate reminders on restart
+        await asyncio.sleep(300)  # 5-minute delay
+        
+    @tasks.loop(hours=1)
+    async def check_new_members(self):
+        """Check for new members who haven't started onboarding."""
+        try:
+            if not self.bot.is_ready():
+                logger.debug("Bot not ready yet, skipping check_new_members")
+                return
+
+            guild = self.bot.get_guild(GUILD_ID)
+            if not guild:
+                logger.error(f"Could not find guild with ID {GUILD_ID}")
+                return
+
+            now = datetime.now(timezone.utc)
+            welcome_channel = guild.get_channel(WELCOME_CHANNEL_ID)
+            admin_channel = guild.get_channel(STAFF_NOTIFICATION_CHANNEL_ID)
+
+            for member in guild.members:
+                # Skip if member is a bot or is already in Coda
+                if member.bot or str(member.id) in self.registered_user_ids:
+                    logger.debug(f"Skipping {member.name} - bot or registered user")
+                    continue
+
+                logger.debug(f"Checking member {member.name} ({member.id})")
+                dm_status = self.dm_tracker.get_dm_status(str(member.id))
+                logger.debug(f"DM status for {member.name}: {dm_status}")
+
+                # First, check if we should skip this user entirely
+                if dm_status.get("status") == "dm_failed" and dm_status.get("channel_attempts", 0) >= 3:
+                    logger.debug(f"Skipping {member.name} - maximum attempts reached")
+                    continue
+
+                if dm_status.get("admin_notified", True):
+                    logger.debug(f"Skipping {member.name} - admin already notified")
+                    continue
+
+                # If we haven't tried DMing yet
+                if not dm_status.get("dm_sent", False) and dm_status.get("status") != "dm_failed":
+                    try:
+                        logger.debug(f"Attempting to DM {member.name}")
+                        await member.send(
+                            "Welcome! To get started with our community, please use the "
+                            "`/start` command in the server to begin the onboarding process."
+                        )
+                        await self.dm_tracker.update_dm_status(
+                            str(member.id), 
+                            "dm_success",
+                            channel_attempts=0
+                        )
+                        logger.info(f"Successfully sent welcome DM to {member.name}")
+                        continue  # Move to next member after successful DM
+
+                    except discord.Forbidden:
+                        logger.warning(f"Could not DM {member.name} - forbidden")
+                        await self.dm_tracker.update_dm_status(
+                            str(member.id), 
+                            "dm_failed",
+                            channel_attempts=0
+                        )
+
+                # Handle channel mentions if DM failed
+                if dm_status.get("status") == "dm_failed":
+                    channel_attempts = dm_status.get("channel_attempts", 0)
+                    
+                    # Check if we should make another channel attempt
+                    if channel_attempts < 3:
+                        last_attempt = dm_status.get("last_channel_attempt")
+                        should_attempt = True
+
+                        if last_attempt:
+                            last_attempt = datetime.fromisoformat(last_attempt)
+                            time_since_attempt = (now - last_attempt).total_seconds()
+                            if time_since_attempt < 7 * 24 * 3600:  # 7 days
+                                should_attempt = False
+                                logger.debug(f"Skipping {member.name} - too soon since last attempt")
+
+                        if should_attempt and welcome_channel:
+                            logger.debug(f"Sending channel mention to {member.name} (attempt {channel_attempts + 1})")
+                            await welcome_channel.send(
+                                f"{member.mention}, I tried to send you a DM about onboarding, "
+                                "but your DMs are disabled. Please use `/start` to begin "
+                                "the onboarding process."
+                            )
+                            await self.dm_tracker.update_dm_status(
+                                str(member.id),
+                                "dm_failed",
+                                channel_attempts=channel_attempts + 1
+                            )
+                    
+                    # Send admin notification if we've reached max attempts
+                    elif channel_attempts >= 3 and not dm_status.get("admin_notified", False):
+                        if admin_channel:
+                            logger.debug(f"Sending admin notification for {member.name}")
+                            join_date = member.joined_at.strftime("%Y-%m-%d %H:%M:%S UTC") if member.joined_at else "Unknown"
+                            embed = discord.Embed(
+                                title="⚠️ Onboarding Alert",
+                                description=(
+                                    f"Member {member.mention} has not started onboarding after 3 reminder attempts\n"
+                                    f"Joined: {join_date}\n"
+                                    "DMs are disabled and channel mentions have been unsuccessful."
+                                ),
+                                color=discord.Color.red()
+                            )
+                            await admin_channel.send(embed=embed)
+                            await self.dm_tracker.update_dm_status(
+                                str(member.id),
+                                "dm_failed",
+                                channel_attempts=3
+                            )
+
+        except Exception as e:
+            logger.error(f"Error in check_new_members: {str(e)}", exc_info=True)
+
+    @check_new_members.before_loop
+    async def before_check_new_members(self):
+        """Wait until the bot is ready before starting the task."""
+        await self.bot.wait_until_ready()
+        logger.info("Starting check_new_members task")
+
+    async def get_pending_onboardings(self) -> Dict[str, Dict[str, Any]]:
+        """Retrieves users who have started but not completed onboarding."""
+        pending_users = {}
+        endpoint_base = f'docs/{DOC_ID}/tables/{TABLE_ID}/rows?useColumnNames=true'
+        page_token = None
+        
+        try:
+            while True:
+                endpoint = f'{endpoint_base}&pageToken={page_token}' if page_token else endpoint_base
+                response = await self.coda_api_request('GET', endpoint)
+                if response and 'items' in response:
+                    for item in response['items']:
+                        values = item.get('values', {})
+                        discord_user_id = values.get('Discord User ID')
+                        status = values.get('Status')
+                        if discord_user_id and status == 'Started':
+                            started_at_str = values.get('Started At')
+                            last_reminder_str = values.get('Last Reminder Sent')
+                            started_at = datetime.fromisoformat(started_at_str) if started_at_str else None
+                            last_reminder = datetime.fromisoformat(last_reminder_str) if last_reminder_str else None
+                            pending_users[discord_user_id] = {
+                                'Row ID': item['id'],
+                                'Started At': started_at,
+                                'Last Reminder Sent': last_reminder
+                            }
+                    page_token = response.get('nextPageToken')
+                    if not page_token:
+                        break
+                else:
+                    logger.error("Failed to fetch pending onboardings from Coda.io.")
+                    break
+        except Exception as e:
+            logger.error(f"Error getting pending onboardings: {str(e)}", exc_info=True)
+        
+        return pending_users
+
+    # ------------------------------ Command Definitions ------------------------------
+	   @app_commands.command(name="start", description="Begin the onboarding process.")
+		@app_commands.guild_only()
+		@app_commands.guilds(discord.Object(id=GUILD_ID))
+		async def start(self, interaction: discord.Interaction):
+		    """Begins the onboarding process by presenting member type options."""
+		    logger.info(f"'/start' command invoked by {interaction.user}.")
+		    
+		    try:
+		        # Defer the response first
+		        await interaction.response.defer(ephemeral=True)
+		        
+		        # Add a small delay for stability
+		        await asyncio.sleep(0.5)
+		        
+		        await self.refresh_registered_user_ids()
+		
+		        if str(interaction.user.id) in self.registered_user_ids:
+		            await interaction.followup.send(
+		                "❌ You have already started or completed onboarding.", 
+		                ephemeral=True
+		            )
+		            logger.info(f"Member {interaction.user} has already started or completed onboarding.")
+		            return
+		
+		        # Create and send button view with shorter timeout
+		        view = discord.ui.View(timeout=180)  # 3 minutes instead of 5
+		        
+		        member_button = discord.ui.Button(
+		            label="Member",
+		            style=discord.ButtonStyle.primary,
+		            custom_id="member_button"
+		        )
+		        associate_button = discord.ui.Button(
+		            label="Associate",
+		            style=discord.ButtonStyle.secondary,
+		            custom_id="associate_button"
+		        )
+		
+		        async def member_callback(interaction: discord.Interaction):
+		            try:
+		                await self.handle_onboarding_start(interaction, 'Member')
+		            except Exception as e:
+		                logger.error(f"Error in member callback: {str(e)}", exc_info=True)
+		                await interaction.response.send_message(
+		                    "❌ An error occurred. Please try again or contact staff.",
+		                    ephemeral=True
+		                )
+		
+		        async def associate_callback(interaction: discord.Interaction):
+		            try:
+		                await self.handle_onboarding_start(interaction, 'Associate')
+		            except Exception as e:
+		                logger.error(f"Error in associate callback: {str(e)}", exc_info=True)
+		                await interaction.response.send_message(
+		                    "❌ An error occurred. Please try again or contact staff.",
+		                    ephemeral=True
+		                )
+		
+		        member_button.callback = member_callback
+		        associate_button.callback = associate_callback
+		        
+		        view.add_item(member_button)
+		        view.add_item(associate_button)
+		
+		        await interaction.followup.send(
+		            "Please select your onboarding type:",
+		            view=view,
+		            ephemeral=True
+		        )
+		        logger.info(f"Sent onboarding type selection view to {interaction.user}")
+		
+		    except Exception as e:
+		        logger.error(f"Error processing /start command for {interaction.user}: {str(e)}", exc_info=True)
+		        try:
+		            await interaction.followup.send(
+		                "❌ An error occurred processing your request. Please try again later.",
+		                ephemeral=True
+		            )
+		        except:
+		            # If we can't send followup, try to create a new response
+		            try:
+		                await interaction.response.send_message(
+		                    "❌ An error occurred processing your request. Please try again later.",
+		                    ephemeral=True
+		                )
+		            except:
+		                logger.error("Could not send error message to user")
+
+
+
+    @app_commands.command(name="register", description="Complete your registration with the provided token.")
+    @app_commands.guild_only()
+    @app_commands.guilds(discord.Object(id=GUILD_ID))
+    @app_commands.describe(token='Your registration token.')
+    async def register(self, interaction: discord.Interaction, token: str):
+        """Completes registration using the provided token."""
+        logger.info(f"'/register' command invoked by {interaction.user} with token '{token}'.")
+        await interaction.response.defer(ephemeral=True)
+
+        # Validate token format
+        if not token or len(token) != 8:
+            await interaction.followup.send(
+                "❌ Invalid token format. Please ensure you've entered the correct token.",
+                ephemeral=True
+            )
+            return
+
+        # Fetch the member from the guild
+        guild = interaction.guild
+        member = interaction.user
+
+        try:
+            # Find the user in Coda.io with the provided token
+            all_rows = await self.get_all_rows()
+            member_row = None
+            for item in all_rows:
+                values = item.get('values', {})
+                if values.get('Token') == token and values.get('Status') in ['Unused', 'Started']:
+                    member_row = item
+                    break
+
+            if not member_row:
+                await interaction.followup.send(
+                    "❌ Invalid or already used token. Please ensure you've entered the correct token.",
+                    ephemeral=True
+                )
+                logger.warning(f"Invalid or used token '{token}' attempted by {interaction.user}.")
+                return
+
+            # Check token expiry
+            started_at = datetime.fromisoformat(member_row['values'].get('Started At', ''))
+            if (datetime.now(timezone.utc) - started_at).total_seconds() > self.token_expiry:
+                await interaction.followup.send(
+                    "❌ This token has expired. Please use `/start` to receive a new token.",
+                    ephemeral=True
+                )
+                return
+
+            # Update the row's Status to 'Active'
+            member_row_id = member_row['id']
+            updates = {
+                'Status': 'Active'
+            }
+            update_success = await self.update_member_info(member_row_id, updates)
+            if not update_success:
+                await interaction.followup.send(
+                    "❌ Failed to update your registration status. Please contact an administrator.",
+                    ephemeral=True
+                )
+                logger.error(f"Failed to update registration status for token '{token}' and user {interaction.user}.")
+                return
+
+            # Get member type from the row
+            member_type = member_row['values'].get('Type', 'Member')
+            rank_role_name = 'Crewman Recruit' if member_type == 'Member' else 'Associate'
+
+            # Assign roles
+            role_success, role_error = await self.assign_roles(member, rank_role_name, guild)
+            if not role_success:
+                await interaction.followup.send(f"❌ {role_error}", ephemeral=True)
+                return
+
+            # Update nickname
+            nick_success, nick_error = await self.update_member_nickname(member, rank_role_name, member_type)
+            if not nick_success:
+                await interaction.followup.send(
+                    f"✅ Roles assigned successfully, but {nick_error}",
+                    ephemeral=True
+                )
+
+            # Send welcome messages
+            try:
+                dm_message = (
+                    f"Welcome aboard {member.name}!\n\n"
+                    f"Your registration is complete. You've been assigned as a {rank_role_name} "
+                    f"in the Non-Division section.\n\n"
+                    f"Feel free to explore the server and ask questions if needed!"
+                )
+                await member.send(dm_message)
+                logger.info(f"Sent welcome DM to {member}")
+            except discord.Forbidden:
+                logger.warning(f"Failed to send DM to {member} after registration.")
+
+            # Send welcome message in welcome channel
+            welcome_channel = self.bot.get_channel(WELCOME_CHANNEL_ID)
+            if welcome_channel:
+                await welcome_channel.send(
+                    f"Please welcome our newest {member_type.lower()}, {member.mention}! 🎉"
+                )
+                logger.info(f"Sent welcome message for {member} in welcome channel")
+
+            await interaction.followup.send(
+                "✅ Registration complete! Welcome aboard!",
+                ephemeral=True
+            )
+            logger.info(f"Completed registration for {member}")
+
+        except Exception as e:
+            logger.error(f"Error during registration for {member}: {str(e)}", exc_info=True)
+            await interaction.followup.send(
+                "❌ An error occurred during registration. Please contact an administrator.",
+                ephemeral=True
+            )
+
+# ------------------------------ Admin Commands ------------------------------
+@admin_onboarding.command(name='status', description='Check the onboarding status of a member')
+@app_commands.describe(member='The member to check')
+@app_commands.checks.has_permissions(administrator=True)
+async def onboarding_status(interaction: discord.Interaction, member: discord.Member):
+    """Checks the onboarding status of a specified member."""
+    logger.debug(f"Command 'status' invoked by {interaction.user} for member {member}.")
+    await interaction.response.defer(ephemeral=True)
+    cog = interaction.client.get_cog("OnboardingCog")
+    if cog:
+        member_row = await cog.get_member_row_by_discord_id(str(member.id))
+        if member_row:
+            values = member_row['values']
+            embed = discord.Embed(
+                title=f"Onboarding Status for {member}",
+                color=discord.Color.blue()
+            )
+            embed.add_field(
+                name="Status",
+                value=values.get('Status', 'Unknown'),
+                inline=True
+            )
+            embed.add_field(
+                name="Type",
+                value=values.get('Type', 'Unknown'),
+                inline=True
+            )
+            embed.add_field(
+                name="Started At",
+                value=values.get('Started At', 'Unknown'),
+                inline=False
+            )
+            await interaction.followup.send(embed=embed, ephemeral=True)
+            logger.info(f"Provided onboarding status for {member}")
+        else:
+            await interaction.followup.send(
+                f"No onboarding data found for {member.mention}.",
+                ephemeral=True
+            )
+            logger.warning(f"No onboarding data found for {member}")
+    else:
+        await interaction.followup.send(
+            "❌ OnboardingCog is not loaded.",
+            ephemeral=True
+        )
+        logger.error("OnboardingCog not found")
+
+@admin_onboarding.command(name='pending', description='List all users who have not completed onboarding')
+@app_commands.checks.has_permissions(administrator=True)
+async def onboarding_pending(interaction: discord.Interaction):
+    """Lists all users who have not completed the onboarding process."""
+    logger.debug(f"Command 'pending' invoked by {interaction.user}.")
+    await interaction.response.defer(ephemeral=True)
+    cog = interaction.client.get_cog("OnboardingCog")
+    if cog:
+        pending_users = await cog.get_pending_onboardings()
+        if pending_users:
+            embed = discord.Embed(
+                title="Pending Onboardings",
+                color=discord.Color.orange()
+            )
+            for user_id_str, data in pending_users.items():
+                user = cog.bot.get_user(int(user_id_str))
+                if user:
+                    started_at = data.get('Started At')
+                    started_at_str = started_at.strftime("%Y-%m-%d %H:%M:%S") if started_at else "Unknown"
+                    embed.add_field(
+                        name=str(user),
+                        value=f"Started At: {started_at_str}",
+                        inline=False
+                    )
+            await interaction.followup.send(embed=embed, ephemeral=True)
+            logger.info(f"Listed {len(pending_users)} pending onboardings")
+        else:
+            await interaction.followup.send(
+                "No pending onboardings found.",
+                ephemeral=True
+            )
+            logger.info("No pending onboardings found")
+    else:
+        await interaction.followup.send(
+            "❌ OnboardingCog is not loaded.",
+            ephemeral=True
+        )
+        logger.error("OnboardingCog not found")
+
+@admin_onboarding.command(name='reset', description='Reset a member\'s onboarding process')
+@app_commands.describe(member='The member to reset')
+@app_commands.checks.has_permissions(administrator=True)
+async def onboarding_reset(interaction: discord.Interaction, member: discord.Member):
+    """Resets the onboarding process for a specified member."""
+    logger.debug(f"Command 'reset' invoked by {interaction.user} for member {member}.")
+    await interaction.response.defer(ephemeral=True)
+    cog = interaction.client.get_cog("OnboardingCog")
+    if cog:
+        # Generate new token and reset status
+        new_token = cog.generate_token()
+        updates = {
+            'Status': 'Started',
+            'Token': new_token,
+            'Started At': datetime.now(timezone.utc).isoformat()
+        }
+        success = await cog.update_member_info_by_discord_id(str(member.id), updates)
+        if success:
+            try:
+                await member.send(
+                    f"Your onboarding process has been reset. Your new token is: {new_token}"
+                )
+                await interaction.followup.send(
+                    f"✅ Onboarding process for {member.mention} has been reset and new token sent.",
+                    ephemeral=True
+                )
+            except discord.Forbidden:
+                await interaction.followup.send(
+                    f"✅ Onboarding process reset. Unable to DM {member.mention}. "
+                    f"New token: {new_token}",
+                    ephemeral=True
+                )
+            logger.info(f"Onboarding process for {member} has been reset by {interaction.user}")
+        else:
+            await interaction.followup.send(
+                f"❌ Failed to reset onboarding process for {member.mention}.",
+                ephemeral=True
+            )
+            logger.error(f"Failed to reset onboarding process for {member}")
+    else:
+        await interaction.followup.send(
+            "❌ OnboardingCog is not loaded.",
+            ephemeral=True
+        )
+        logger.error("OnboardingCog not found")
+
+# ------------------------------ Cog Setup ------------------------------
+async def setup(bot: commands.Bot):
+    """Sets up the OnboardingCog."""
+    await bot.add_cog(OnboardingCog(bot))
+    bot.tree.add_command(admin_onboarding)  # Register admin commands
+    logger.info("OnboardingCog has been added to the bot.")
