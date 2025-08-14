@@ -1,0 +1,360 @@
+"""Enhanced formatting classes for profile displays."""
+
+import logging
+import discord
+from datetime import datetime, timezone
+from typing import Dict, List, Optional, Any
+import math
+from .utils import calculate_service_time, format_stellar_date, get_rank_info, parse_list_field
+from .security import get_security_classification, get_clearance_code, generate_auth_code
+from .constants import (
+    SECURITY_LEVELS, STATUS_INDICATORS, DIVISION_ICONS, FIELD_ID_NUMBER,
+    FIELD_DIVISION, FIELD_RANK, FIELD_STATUS, FIELD_SPECIALIZATION,
+    FIELD_JOIN_DATE, FIELD_AWARDS, FIELD_CERTIFICATIONS, FIELD_COMPLETED_MISSIONS,
+    FIELD_MISSION_COUNT, FIELD_COMBAT_MISSIONS, FIELD_STRATEGIC_ASSESSMENT,
+    FIELD_COMMAND_EVALUATION, FIELD_SPECIAL_OPERATIONS, FIELD_STRATEGIC_PLANNING,
+    FIELD_CLASSIFIED_INFO, DIVISION_RANKS, DIVISION_TO_STANDARD_RANK
+)
+
+logger = logging.getLogger('profile.formatters')
+
+def create_progress_bar(value, max_value, width=10):
+    """
+    Create a Unicode progress bar.
+    
+    Args:
+        value: Current value
+        max_value: Maximum value
+        width: Width of progress bar in characters
+        
+    Returns:
+        String containing a progress bar
+    """
+    if max_value <= 0:
+        return "░" * width
+    
+    # Calculate number of filled blocks
+    filled = min(width, max(0, int(value / max_value * width)))
+    
+    # Create the bar
+    return "█" * filled + "░" * (width - filled)
+
+class MilitaryIDFormatter:
+    """Formats military profile information for display with enhanced visuals."""
+    
+    @staticmethod
+    def create_header(rank: str, values: dict, member: discord.Member) -> str:
+        """Create the header section of a profile display."""
+        classification, _ = get_security_classification(rank or "")
+        security_emoji = SECURITY_LEVELS.get(classification, '⚪')
+        display_name = member.display_name
+        return (
+            f"{security_emoji} **{display_name}** {security_emoji}\n"
+            f"{security_emoji} **HLN GROUP STARWARD FLEET** {security_emoji}\n"
+            "```yaml\n"
+            f"SECURITY CLASSIFICATION: {classification}\n"
+            f"CLEARANCE CODE: {get_clearance_code(rank or '')}\n"
+            "```"
+        )
+
+    @staticmethod
+    def create_mobile_header(rank: str, values: dict, member: discord.Member) -> str:
+        """Create a more compact header for mobile devices."""
+        classification, _ = get_security_classification(rank or "")
+        security_emoji = SECURITY_LEVELS.get(classification, '⚪')
+        display_name = member.display_name
+        return (
+            f"{security_emoji} **{display_name}** {security_emoji}\n"
+            f"```yaml\n"
+            f"CLASS: {classification} | {get_clearance_code(rank or '')}\n"
+            "```"
+        )
+
+    @staticmethod
+    def format_basic_info(values: dict, is_mobile: bool = False) -> str:
+        """
+        Format basic member information with specialized rank display.
+        Properly handles both display formats - specialized (standard) and standard (specialized).
+        """
+        from datetime import datetime
+        from .constants import (
+            DIVISION_RANKS, DIVISION_ICONS, STATUS_INDICATORS,
+            FIELD_ID_NUMBER, FIELD_DIVISION, FIELD_STATUS, FIELD_SPECIALIZATION, 
+            FIELD_RANK, DIVISION_TO_STANDARD_RANK
+        )
+        
+        # Pull relevant fields
+        division = values.get(FIELD_DIVISION, 'N/A')
+        prefix = DIVISION_ICONS.get(division, '[--]')
+        
+        status = values.get(FIELD_STATUS, 'Active')
+        status_emoji = STATUS_INDICATORS.get(status, '⚪')
+        
+        # Last active fallback
+        last_active_str = "Unknown"
+        last_active_raw = values.get('last_active')
+        if last_active_raw:
+            try:
+                dt = datetime.fromisoformat(last_active_raw)
+                last_active_str = dt.strftime("%Y-%m-%d %H:%M UTC")
+            except Exception:
+                pass
+        
+        # Get current rank and specialization
+        current_rank = values.get(FIELD_RANK, 'N/A')
+        specialty = values.get(FIELD_SPECIALIZATION, 'N/A')
+        
+        # By default, display just the current rank
+        final_rank_display = current_rank
+        
+        # Special handling for Marines in Tactical Division
+        if division == "Tactical" and specialty == "Marines":
+            # Hard-coded mappings for common Marine ranks to fleet ranks
+            marine_to_fleet = {
+                "Colonel": "Fleet Captain",
+                "Lieutenant Colonel": "Captain",
+                "Major": "Commander",
+                "Captain": "Lieutenant Commander",
+                "First Lieutenant": "Lieutenant",
+                "Second Lieutenant": "Lieutenant Junior Grade",
+                "Sergeant Major": "Chief Petty Officer",
+                "Master Sergeant": "Petty Officer 1st Class",
+                "Sergeant First Class": "Petty Officer 2nd Class",
+                "Staff Sergeant": "Petty Officer 3rd Class",
+                "Sergeant": "Master Crewman", 
+                "Corporal": "Senior Crewman",
+                "Lance Corporal": "Crewman",
+                "Private First Class": "Crewman Apprentice",
+                "Private": "Crewman Recruit"
+            }
+            
+            # Look for direct match in our marine ranks dictionary
+            if current_rank in marine_to_fleet:
+                standard_rank = marine_to_fleet[current_rank]
+                final_rank_display = f"{current_rank} ({standard_rank})"
+                
+        # If not handled by special case above, try looking in DIVISION_TO_STANDARD_RANK
+        elif not final_rank_display.startswith(current_rank + " ("):
+            # Create lookup key - the key in this dictionary is (division, specialty, specialized_rank)
+            for (div, spec, specialized), standard_rank in DIVISION_TO_STANDARD_RANK.items():
+                if (div.lower() == division.lower() and 
+                    spec.lower() == specialty.lower() and 
+                    specialized.lower() == current_rank.lower()):
+                    final_rank_display = f"{current_rank} ({standard_rank})"
+                    break
+                    
+        # Now build the output block. For mobile, we do a condensed view:
+        if is_mobile:
+            return (
+                "```yaml\n"
+                f"ID: {values.get(FIELD_ID_NUMBER, 'N/A')}\n"
+                f"RANK: {final_rank_display}\n"
+                f"DIV: {prefix} {division}\n"
+                f"SPEC: {specialty}\n"
+                f"STATUS: {status_emoji} {status}\n"
+                "```"
+            )
+        else:
+            return (
+                "```yaml\n"
+                f"SERVICE ID: {values.get(FIELD_ID_NUMBER, 'N/A')}\n"
+                f"RANK: {final_rank_display}\n"
+                f"DIVISION: {prefix} {division}\n"
+                f"SPECIALIZATION: {specialty}\n"
+                f"STATUS: {status_emoji} {status}\n"
+                f"LAST ACTIVE: {last_active_str}\n"
+                "```"
+            )
+
+
+    @staticmethod
+    def format_service_record(values: dict, is_mobile: bool = False) -> str:
+        """Format service record information."""
+        join_date = values.get(FIELD_JOIN_DATE, 'N/A')
+        service_time = calculate_service_time(join_date)
+        
+        if is_mobile:
+            # Compact format for mobile
+            return (
+                "```yaml\n"
+                f"ENLISTED: {format_stellar_date(join_date)}\n"
+                f"SERVICE: {service_time}\n"
+                f"ASSIGNMENT: {values.get(FIELD_DIVISION, 'N/A')}\n"
+                "```"
+            )
+        else:
+            return (
+                "```yaml\n"
+                f"ENLISTMENT DATE: {format_stellar_date(join_date)}\n"
+                f"TIME IN SERVICE: {service_time}\n"
+                f"CURRENT ASSIGNMENT: {values.get(FIELD_DIVISION, 'N/A')} DIVISION\n"
+                f"SECURITY CLEARANCE: {get_clearance_code(values.get(FIELD_RANK, 'N/A'))}\n"
+                "```"
+            )
+
+    @staticmethod
+    def format_awards(values: dict, is_mobile: bool = False) -> str:
+        """Format awards information."""
+        awards = parse_list_field(values.get(FIELD_AWARDS, []))
+        if not awards:
+            return "```yaml\nNo decorations awarded```"
+            
+        if is_mobile and len(awards) > 3:
+            # Show only the most recent 3 for mobile
+            lines = [f"◈ {a}" for a in awards[:3]]
+            lines.append(f"...and {len(awards) - 3} more")
+            return "```yaml\n" + "\n".join(lines) + "```"
+        else:
+            lines = [f"◈ {a}" for a in awards]
+            return "```yaml\n" + "\n".join(lines) + "```"
+
+    @staticmethod
+    def format_classified_info(values: dict, rank: str) -> Optional[str]:
+        """Format classified information if available."""
+        from .constants import CLEARANCE_LEVELS
+        clearance = CLEARANCE_LEVELS.get(rank, {'level': 1})
+        if clearance['level'] >= 4:  # e.g. rank >= Commodore
+            cinfo = values.get(FIELD_CLASSIFIED_INFO)
+            if cinfo:
+                return (
+                    "```yaml\n"
+                    f"CLASSIFIED INFORMATION - {get_clearance_code(rank)}\n"
+                    f"{cinfo}\n"
+                    "```"
+                )
+        return None
+
+    @staticmethod
+    def format_mission_log(values: dict, is_mobile: bool = False) -> str:
+        """Format mission log information."""
+        missions = parse_list_field(values.get(FIELD_COMPLETED_MISSIONS, []))
+        if not missions:
+            return "```yaml\nNo missions completed```"
+            
+        if is_mobile and len(missions) > 3:
+            # Show only the 3 most recent missions for mobile
+            formatted_missions = "\n".join([f"• {mission}" for mission in missions[:3]])
+            formatted_missions += f"\n...and {len(missions) - 3} more"
+        else:
+            formatted_missions = "\n".join([f"• {mission}" for mission in missions])
+            
+        return f"```yaml\n{formatted_missions}\n```"
+
+    @staticmethod
+    def format_certifications(values: dict, is_mobile: bool = False) -> str:
+        """Format certification information."""
+        certifications = parse_list_field(values.get(FIELD_CERTIFICATIONS, []))
+        if not certifications:
+            return "```yaml\nNo certifications recorded```"
+            
+        if is_mobile and len(certifications) > 5:
+            # Show only top 5 for mobile
+            formatted_certs = "\n".join([f"• {cert}" for cert in certifications[:5]])
+            formatted_certs += f"\n...and {len(certifications) - 5} more"
+        else:
+            formatted_certs = "\n".join([f"• {cert}" for cert in certifications])
+            
+        return f"```yaml\n{formatted_certs}\n```"
+        
+    @staticmethod
+    def format_grouped_certifications(values: dict, is_mobile: bool = False) -> str:
+        """Format certifications grouped by type."""
+        certifications = parse_list_field(values.get(FIELD_CERTIFICATIONS, []))
+        if not certifications:
+            return "```yaml\nNo certifications recorded```"
+            
+        # Group certifications by type
+        combat_certs = []
+        technical_certs = []
+        special_certs = []
+        other_certs = []
+        
+        for cert in certifications:
+            if any(x in cert.lower() for x in ['combat', 'tactical', 'weapons']):
+                combat_certs.append(cert)
+            elif any(x in cert.lower() for x in ['engineering', 'technical', 'systems']):
+                technical_certs.append(cert)
+            elif any(x in cert.lower() for x in ['special', 'advanced', 'classified']):
+                special_certs.append(cert)
+            else:
+                other_certs.append(cert)
+                
+        # If mobile, limit the number of displayed certs
+        if is_mobile:
+            max_per_category = 2
+            if len(combat_certs) > max_per_category:
+                combat_certs = combat_certs[:max_per_category] + [f"...and {len(combat_certs) - max_per_category} more"]
+            if len(technical_certs) > max_per_category:
+                technical_certs = technical_certs[:max_per_category] + [f"...and {len(technical_certs) - max_per_category} more"]
+            if len(special_certs) > max_per_category:
+                special_certs = special_certs[:max_per_category] + [f"...and {len(special_certs) - max_per_category} more"]
+            if len(other_certs) > max_per_category:
+                other_certs = other_certs[:max_per_category] + [f"...and {len(other_certs) - max_per_category} more"]
+                
+        # Format output
+        output = ["```yaml"]
+        if combat_certs:
+            output.append("Combat Certifications:")
+            output.extend(f"  • {cert}" for cert in combat_certs)
+        if technical_certs:
+            output.append("\nTechnical Certifications:")
+            output.extend(f"  • {cert}" for cert in technical_certs)
+        if special_certs:
+            output.append("\nSpecial Certifications:")
+            output.extend(f"  • {cert}" for cert in special_certs)
+        if other_certs:
+            output.append("\nOther Certifications:")
+            output.extend(f"  • {cert}" for cert in other_certs)
+        output.append("```")
+        
+        return '\n'.join(output)
+        
+    @staticmethod
+    def format_quick_stats(values: dict, is_mobile: bool = False) -> str:
+        """Format quick statistics about the member."""
+        mission_count = int(values.get(FIELD_MISSION_COUNT) or 0)
+        combat_missions = len(parse_list_field(values.get(FIELD_COMBAT_MISSIONS, [])))
+        total_awards = len(parse_list_field(values.get(FIELD_AWARDS, [])))
+        join_date = values.get(FIELD_JOIN_DATE, 'Unknown')
+        service_time = calculate_service_time(join_date)
+        
+        # Create progress bars
+        # Assuming mission progression tiers
+        mission_progress = create_progress_bar(mission_count, 50)
+        combat_progress = create_progress_bar(combat_missions, 20)
+        award_progress = create_progress_bar(total_awards, 10)
+        
+        # Format differently based on device
+        if is_mobile:
+            return (
+                "```yaml\n"
+                "STATISTICS:\n"
+                f"Missions: {mission_count} {mission_progress}\n"
+                f"Combat: {combat_missions} {combat_progress}\n"
+                f"Awards: {total_awards} {award_progress}\n"
+                "```"
+            )
+        else:
+            return (
+                "```yaml\n"
+                "QUICK STATISTICS:\n"
+                f"Total Missions: {mission_count} {mission_progress}\n"
+                f"Combat Operations: {combat_missions} {combat_progress}\n"
+                f"Decorations: {total_awards} {award_progress}\n"
+                f"Time in Service: {service_time}\n"
+                "```"
+            )
+
+class WatermarkGenerator:
+    """Generate security watermarks for displays."""
+    
+    @staticmethod
+    def generate_pattern(classification: str) -> str:
+        """Generate a pattern for a security classification."""
+        patterns = {
+            'TOP_SECRET': '▲',
+            'SECRET': '■',
+            'CONFIDENTIAL': '●',
+            'RESTRICTED': '○',
+        }
+        return f"{patterns.get(classification, '○')} {classification} {patterns.get(classification, '○')}"
