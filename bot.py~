@@ -1,0 +1,336 @@
+# bot.py
+from dotenv import load_dotenv
+load_dotenv()
+
+import discord
+from discord.ext import commands
+from discord import app_commands
+import logging
+import logging.handlers
+import os
+import asyncio
+
+# Additional imports (optional, depending on your code structure)
+from cogs.utils.profile_utils import SharedAuditLogger, BackupManager
+from cogs.utils.profile_sync import ProfileSyncManager
+from cogs.utils.coda_api import CodaAPIClient
+from cogs.utils.sync_manager import CommandSyncManager
+from cogs.utils.daily_limit_manager import DailyLimitManager
+from cogs.utils.rate_limit_manager import RateLimitManager
+from cogs.utils.command_state_manager import CommandStateManager
+
+##############################################################################
+# 1) Logging setup
+##############################################################################
+def setup_logging():
+    log_level_name = os.getenv('LOG_LEVEL', 'INFO').upper()
+    log_level = getattr(logging, log_level_name, logging.INFO)
+    
+    detailed_formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+    simple_formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
+
+    root_logger = logging.getLogger()
+    root_logger.setLevel(log_level)
+    root_logger.handlers.clear()
+
+    file_handler = logging.handlers.RotatingFileHandler(
+        filename='bot.log',
+        encoding='utf-8',
+        maxBytes=5 * 1024 * 1024,  # 5 MB
+        backupCount=5,
+        mode='a'
+    )
+    file_handler.setFormatter(detailed_formatter)
+    file_handler.setLevel(log_level)
+
+    console_handler = logging.StreamHandler()
+    console_handler.setFormatter(simple_formatter)
+    console_handler.setLevel(log_level)
+
+    root_logger.addHandler(file_handler)
+    root_logger.addHandler(console_handler)
+
+    # Suppress overly verbose logs
+    logging.getLogger('discord').setLevel(logging.WARNING)
+    logging.getLogger('discord.http').setLevel(logging.WARNING)
+    logging.getLogger('discord.gateway').setLevel(logging.WARNING)
+    
+    logger = logging.getLogger('bot')
+    logger.setLevel(log_level)
+    return logger
+
+logger = setup_logging()
+logger.info(f"Logging configured with level: {logging.getLevelName(logger.getEffectiveLevel())}")
+
+##############################################################################
+# 2) Load environment variables and check token
+##############################################################################
+TOKEN = os.getenv('DISCORD_BOT_TOKEN')
+if not TOKEN:
+    logger.error("ERROR: DISCORD_BOT_TOKEN is empty or not set. Please check your .env file.")
+    # Optionally raise an exception or exit
+    raise ValueError("DISCORD_BOT_TOKEN not found!")
+
+logger.info(f"Token length is {len(TOKEN)} characters. (This is just to confirm non-empty.)")
+
+def validate_guild_id():
+    guild_id_str = os.getenv('GUILD_ID')
+    if not guild_id_str:
+        raise ValueError("GUILD_ID is not set in .env")
+    try:
+        guild_id = int(guild_id_str)
+        if guild_id <= 0:
+            raise ValueError("GUILD_ID must be a positive integer")
+        return guild_id
+    except ValueError:
+        raise ValueError("GUILD_ID must be a valid positive integer")
+
+GUILD_ID = validate_guild_id()
+
+# If you have a config.py or config object for this, keep it; just ensure you’re not overwriting anything unintentionally
+import config
+FORCE_SYNC_COMMANDS = config.FORCE_SYNC_COMMANDS
+
+##############################################################################
+# 3) Define Bot & Intents
+##############################################################################
+intents = discord.Intents.default()
+intents.guilds = True
+intents.members = True
+intents.message_content = True
+intents.messages = True
+intents.voice_states = True
+intents.reactions = True
+
+class MyBot(commands.Bot):
+    def __init__(self):
+        # Initialize with all parameters in the super().__init__ call
+        super().__init__(
+            command_prefix=commands.when_mentioned,
+            intents=intents,
+            default_permissions=discord.Permissions(
+                send_messages=True,
+                read_messages=True,
+                read_message_history=True,
+                manage_messages=True,
+                embed_links=True,
+                external_emojis=True,
+                add_reactions=True,
+                view_channel=True
+            ),
+        )
+        self.guild_id = GUILD_ID
+
+        # Extensions list (cogs)
+        self.initial_extensions = [
+            'cogs.onboarding',
+            'cogs.sync_commands',
+            'cogs.aar',
+            'cogs.banking',
+            'cogs.administration',
+            'cogs.fun',
+            'cogs.news_updater',
+            'cogs.payouts',
+            'cogs.profile',
+            'cogs.radio',
+            'cogs.raid_protection',
+            'cogs.welcome',
+            'cogs.fleet_application',
+            'cogs.missions',
+            'cogs.eval',
+            'cogs.srs',
+            'cogs.ships',
+            'cogs.alert',
+            'cogs.commandhub',
+        ]
+
+        # Managers, etc.
+        self.daily_limit_manager = DailyLimitManager()
+        self.rate_limiter = RateLimitManager()
+        self.command_state = CommandStateManager(self)
+        self.sync_manager = CommandSyncManager(self)
+        self.coda_client = CodaAPIClient(os.getenv('CODA_API_TOKEN'))
+        self.profile_sync = ProfileSyncManager(self)
+        self.audit_logger = SharedAuditLogger(self, int(os.getenv('AUDIT_LOG_CHANNEL_ID', 0)))
+        self.backup_manager = BackupManager()
+
+        self.config = {
+            'ADMIN_NOTIFICATIONS_CHANNEL_ID': int(os.getenv('ADMIN_NOTIFICATIONS_CHANNEL_ID', 0)),
+            'GUILD_ID': GUILD_ID,
+            'CODA_DOC_ID': os.getenv('DOC_ID'),
+            'CODA_TABLE_ID': os.getenv('TABLE_ID'),
+            'PROMOTION_REQUESTS_TABLE_ID': os.getenv('PROMOTION_REQUESTS_TABLE_ID'),
+            'AUDIT_LOG_CHANNEL_ID': int(os.getenv('AUDIT_LOG_CHANNEL_ID', 0)),
+            'AAR_CHANNEL_ID': int(os.getenv('AAR_CHANNEL_ID', 0)),
+            'STAFF_NOTIFICATION_CHANNEL_ID': int(os.getenv('STAFF_NOTIFICATION_CHANNEL_ID', 0))
+        }
+
+    async def setup_hook(self):
+        """
+        Called automatically by discord.py when the bot starts, 
+        before on_ready and before connecting to the gateway.
+        """
+        try:
+            # Initialize command tree if needed
+            if not hasattr(self, 'tree') or self.tree is None:
+                self.tree = app_commands.CommandTree(self)
+
+            # 1) Load cogs
+            for extension in self.initial_extensions:
+                try:
+                    await self.load_extension(extension)
+                    logger.info(f"Loaded extension '{extension}'")
+                except Exception as e:
+                    logger.error(f"Failed to load extension {extension}: {e}")
+
+            # 2) Queue commands for syncing
+            guild_obj = discord.Object(id=self.guild_id)
+            
+            try:
+                # Add safety check for tree
+                if not self.tree:
+                    logger.error("Command tree not initialized")
+                    return
+
+                # Get current command states
+                current_commands = await self.tree.fetch_commands(guild=guild_obj)
+                logger.info(f"Current slash command count on Discord: {len(current_commands)}")
+                
+                # Get counts from both state managers
+                sync_manager_count = self.sync_manager.get_synced_command_count()
+                command_state_count = self.command_state.get_synced_command_count()
+                
+                # Validate stored states match
+                if sync_manager_count != command_state_count:
+                    logger.warning(f"State mismatch between managers: sync_manager({sync_manager_count}) != command_state({command_state_count})")
+                    # Use the higher count as source of truth
+                    stored_count = max(sync_manager_count, command_state_count)
+                else:
+                    stored_count = sync_manager_count
+
+                # Compare command IDs instead of just counts
+                current_command_ids = {str(cmd.id) for cmd in current_commands}
+                stored_command_ids = set()
+                
+                # Get stored command IDs from command_state
+                for cog_commands in self.command_state.synced_commands.values():
+                    stored_command_ids.update(cog_commands.values())
+
+                commands_changed = current_command_ids != stored_command_ids
+                
+                # Check if we need to sync
+                needs_sync = (
+                    len(current_commands) == 0 or  # No commands on Discord
+                    commands_changed or            # Command IDs don't match
+                    FORCE_SYNC_COMMANDS           # Manual override
+                )
+                
+                if needs_sync:
+                    # Get all commands first to check limit
+                    commands = self.tree.get_commands()
+                    if not commands:
+                        logger.warning("No commands available to sync")
+                        return
+
+                    if not self.daily_limit_manager.can_add_commands(len(commands)):
+                        logger.error("Daily command limit would be exceeded. Waiting until reset.")
+                        return
+
+                    logger.info(f"Syncing commands due to: {'no commands' if len(current_commands) == 0 else 'command mismatch' if commands_changed else 'force sync'}")
+                    
+                    try:
+                        # Clear existing commands first if any exist
+                        if current_commands:
+                            logger.info("Clearing existing commands...")
+                            await self.tree.sync(guild=guild_obj)
+
+                        # Sync new commands
+                        logger.info(f"Syncing {len(commands)} commands...")
+                        synced = await self.rate_limiter.execute_with_ratelimit(
+                            'guild_commands',
+                            self.tree.sync,
+                            guild=guild_obj
+                        )
+                        
+                        if synced:
+                            # Update state managers
+                            for cmd in synced:
+                                cog_name = getattr(cmd, 'module', 'unknown')
+                                self.command_state.record_command(cog_name, cmd.name, str(cmd.id))
+                                self.sync_manager.record_synced_command(cog_name, cmd.name)
+                            
+                            logger.info(f"Successfully synced {len(synced)} commands")
+                            
+                            # Record the sync in daily limit
+                            self.daily_limit_manager.add_commands(len(synced))
+                        else:
+                            logger.warning("No commands were synced")
+                                
+                    except Exception as e:
+                        logger.error(f"Error during command sync: {str(e)}")
+                        raise
+                else:
+                    logger.info(f"Commands already synced ({len(current_commands)} commands), maintaining state")
+                        
+            except Exception as e:
+                logger.error(f"Error during command sync: {str(e)}")
+                raise
+                    
+        except Exception as e:
+            logger.error(f"Error in setup_hook: {str(e)}")
+            raise
+
+    async def on_ready(self):
+        """
+        Once the bot is fully connected to Discord, you can add 
+        any final startup logic here (but do NOT re-sync commands).
+        """
+        logger.info(f"Logged in as {self.user} (ID: {self.user.id})")
+
+    async def on_app_command_error(self, interaction: discord.Interaction, error: app_commands.AppCommandError):
+        error_message = "An error occurred while processing the command."
+
+        if isinstance(error, app_commands.errors.MissingPermissions):
+            error_message = "❌ You don't have the required permissions for this command."
+        elif isinstance(error, discord.Forbidden):
+            error_message = "❌ I don't have permission to perform this action."
+        elif isinstance(error, app_commands.errors.CommandOnCooldown):
+            error_message = f"❌ This command is on cooldown. Try again in {error.retry_after:.1f} seconds."
+        elif isinstance(error, app_commands.errors.MissingRole):
+            error_message = "❌ You're missing the required role for this command."
+        elif isinstance(error, app_commands.errors.BotMissingPermissions):
+            error_message = "❌ I'm missing the required permissions to perform this action."
+
+        logger.error(f"App command error in {interaction.command.name if interaction.command else 'unknown'}: {str(error)}", exc_info=error)
+        
+        try:
+            if interaction.response.is_done():
+                await interaction.followup.send(error_message, ephemeral=True)
+            else:
+                await interaction.response.send_message(error_message, ephemeral=True)
+        except discord.HTTPException as e:
+            logger.error(f"Could not send error message to user: {str(e)}")
+
+    async def on_command_error(self, ctx, error):
+        if isinstance(error, commands.errors.CheckFailure):
+            await ctx.send("You do not have permission to use this command.")
+        else:
+            logger.error(f"Command error: {error}")
+
+##############################################################################
+# 4) The main entry point
+##############################################################################
+async def main():
+    async with MyBot() as bot:
+        # Start the bot with the verified token
+        await bot.start(TOKEN)
+
+if __name__ == "__main__":
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        logger.info("Bot shutdown by user")
+    except Exception as e:
+        logger.error(f"Bot crashed: {e}")
+        raise
+

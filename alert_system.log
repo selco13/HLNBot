@@ -1,0 +1,23 @@
+2024-12-31 10:50:16,445 - INFO - Successfully loaded AlertSystemCog
+2024-12-31 10:58:04,755 - ERROR - Failed to load AlertSystemCog: Command 'alert_level' already registered.
+2024-12-31 10:59:41,389 - INFO - Successfully loaded AlertSystemCog for guild 1058522038945460327
+2024-12-31 11:05:42,796 - INFO - Successfully loaded AlertSystemCog for guild 1058522038945460327
+2024-12-31 11:09:09,268 - INFO - Successfully loaded AlertSystemCog for guild 1058522038945460327
+2024-12-31 11:09:35,192 - INFO - Successfully loaded AlertSystemCog for guild 1058522038945460327
+2024-12-31 11:09:58,515 - INFO - Successfully loaded AlertSystemCog for guild 1058522038945460327
+2024-12-31 11:12:49,093 - INFO - Successfully loaded AlertSystemCog for guild 1058522038945460327
+2024-12-31 11:13:26,477 - INFO - Alert level changed to LEVEL_1
+2024-12-31 11:29:25,583 - INFO - Successfully loaded AlertSystemCog for guild 1058522038945460327
+2024-12-31 11:32:28,866 - INFO - Successfully loaded AlertSystemCog for guild 1058522038945460327
+2024-12-31 11:33:58,299 - INFO - Alert level changed to LEVEL_1
+2024-12-31 11:53:21,107 - INFO - Alert level changed to LEVEL_1
+2024-12-31 11:53:40,305 - INFO - Successfully loaded AlertSystemCog for guild 1058522038945460327
+2024-12-31 11:53:50,649 - INFO - Alert level changed to LEVEL_1
+2024-12-31 14:10:10,223 - INFO - Successfully loaded AlertSystemCog for guild 1058522038945460327
+2024-12-31 14:20:00,584 - INFO - Successfully loaded AlertSystemCog for guild 1058522038945460327
+2024-12-31 14:24:17,971 - INFO - Successfully loaded AlertSystemCog for guild 1058522038945460327
+2024-12-31 14:26:21,257 - INFO - Successfully loaded AlertSystemCog for guild 1058522038945460327
+2024-12-31 14:28:49,329 - INFO - Successfully loaded AlertSystemCog for guild 1058522038945460327
+2024-12-31 18:15:48,897 - INFO - Successfully loaded AlertSystemCog for guild 1058522038945460327
+2024-12-31 18:23:48,204 - INFO - Successfully loaded AlertSystemCog for guild 1058522038945460327
+2025-01-01 14:20:06,021 - INFO - Successfully loaded AlertSystemCog for guild 1058522038945460327
